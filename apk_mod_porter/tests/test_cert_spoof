@@ -1,0 +1,286 @@
+"""Unit tests for cert_spoof helpers. These use synthetic APKs / smali and never touch a real game.
+
+Run: python -m unittest tests.test_cert_spoof -v
+"""
+import logging
+import struct
+import sys
+import tempfile
+import textwrap
+import unittest
+import zipfile
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from apkporter import cert_spoof as cs
+
+
+def _log():
+    return logging.getLogger("test")
+
+
+# --------------------------------------------------------------------------- manifest helpers
+def _write_manifest(dir_path: Path, package: str, activity: str, use_alias: bool = False):
+    if use_alias:
+        body = f"""\
+        <manifest xmlns:android="http://schemas.android.com/apk/res/android" package="{package}">
+          <application>
+            <activity android:name="com.example.app.HiddenActivity"/>
+            <activity-alias android:name="com.example.app.AliasActivity"
+                            android:targetActivity="{activity}">
+              <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+              </intent-filter>
+            </activity-alias>
+          </application>
+        </manifest>
+        """
+    else:
+        body = f"""\
+        <manifest xmlns:android="http://schemas.android.com/apk/res/android" package="{package}">
+          <application>
+            <activity android:name="{activity}">
+              <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+              </intent-filter>
+            </activity>
+          </application>
+        </manifest>
+        """
+    (dir_path / "AndroidManifest.xml").write_text(textwrap.dedent(body), encoding="utf-8")
+
+
+def _write_smali(path: Path, body: str = None):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body or textwrap.dedent("""
+        .class public Lcom/example/app/MainActivity;
+        .super Landroid/app/Activity;
+        .method protected onCreate(Landroid/os/Bundle;)V
+            .locals 2
+            invoke-super {p0, p1}, Landroid/app/Activity;->onCreate(Landroid/os/Bundle;)V
+            return-void
+        .end method
+    """), encoding="utf-8")
+
+
+# --------------------------------------------------------------------------- tests
+class FindLauncherSmali(unittest.TestCase):
+    def test_primary_smali_folder(self):
+        tmp = Path(tempfile.mkdtemp())
+        _write_manifest(tmp, "com.example.app", "com.example.app.MainActivity")
+        smali = tmp / "smali" / "com" / "example" / "app" / "MainActivity.smali"
+        _write_smali(smali)
+        found = cs.find_launcher_smali(tmp, _log())
+        self.assertEqual(found, smali)
+
+    def test_multidex_fallback(self):
+        tmp = Path(tempfile.mkdtemp())
+        _write_manifest(tmp, "com.example.app", "com.example.app.MainActivity")
+        (tmp / "smali").mkdir()  # primary exists but is empty
+        smali = tmp / "smali_classes3" / "com" / "example" / "app" / "MainActivity.smali"
+        _write_smali(smali)
+        found = cs.find_launcher_smali(tmp, _log())
+        self.assertEqual(found, smali)
+
+    def test_relative_activity_name_uses_package(self):
+        tmp = Path(tempfile.mkdtemp())
+        _write_manifest(tmp, "com.example.app", ".MainActivity")
+        smali = tmp / "smali" / "com" / "example" / "app" / "MainActivity.smali"
+        _write_smali(smali)
+        found = cs.find_launcher_smali(tmp, _log())
+        self.assertEqual(found, smali)
+
+    def test_activity_alias_target(self):
+        tmp = Path(tempfile.mkdtemp())
+        _write_manifest(tmp, "com.example.app", "com.example.app.RealActivity", use_alias=True)
+        smali = tmp / "smali" / "com" / "example" / "app" / "RealActivity.smali"
+        _write_smali(smali)
+        found = cs.find_launcher_smali(tmp, _log())
+        self.assertEqual(found, smali)
+
+    def test_no_launcher_raises(self):
+        tmp = Path(tempfile.mkdtemp())
+        (tmp / "AndroidManifest.xml").write_text(
+            '<manifest package="com.example.app"><application/></manifest>', encoding="utf-8")
+        with self.assertRaises(cs.CertSpoofError):
+            cs.find_launcher_smali(tmp, _log())
+
+    def test_missing_smali_raises(self):
+        tmp = Path(tempfile.mkdtemp())
+        _write_manifest(tmp, "com.example.app", "com.example.app.MainActivity")
+        (tmp / "smali").mkdir()
+        with self.assertRaises(cs.CertSpoofError):
+            cs.find_launcher_smali(tmp, _log())
+
+
+class InjectHook(unittest.TestCase):
+    def _mk(self, body: str) -> Path:
+        tmp = Path(tempfile.mkdtemp())
+        smali = tmp / "MainActivity.smali"
+        smali.write_text(textwrap.dedent(body), encoding="utf-8")
+        return smali
+
+    def test_inserts_after_locals(self):
+        smali = self._mk("""
+            .class public Lcom/example/app/MainActivity;
+            .super Landroid/app/Activity;
+            .method protected onCreate(Landroid/os/Bundle;)V
+                .locals 2
+                invoke-super {p0, p1}, Landroid/app/Activity;->onCreate(Landroid/os/Bundle;)V
+                return-void
+            .end method
+        """)
+        cs.inject_hook(smali, "deadbeef", _log())
+        out = smali.read_text()
+        self.assertIn("CertSpoof;->install(Ljava/lang/String;)V", out)
+        self.assertIn('const-string v0, "deadbeef"', out)
+        # hook must be before the original invoke-super
+        self.assertLess(out.index("CertSpoof;->install"), out.index("invoke-super"))
+
+    def test_bumps_zero_locals(self):
+        smali = self._mk("""
+            .class public Lcom/example/app/MainActivity;
+            .method protected onCreate(Landroid/os/Bundle;)V
+                .locals 0
+                return-void
+            .end method
+        """)
+        cs.inject_hook(smali, "deadbeef", _log())
+        out = smali.read_text()
+        self.assertIn(".locals 1", out)
+        self.assertIn("CertSpoof;->install", out)
+
+    def test_refuses_double_injection(self):
+        smali = self._mk("""
+            .class public Lcom/example/app/MainActivity;
+            .method protected onCreate(Landroid/os/Bundle;)V
+                .locals 1
+                const-string v0, "x"
+                invoke-static {v0}, Lcom/android/support/CertSpoof;->install(Ljava/lang/String;)V
+                return-void
+            .end method
+        """)
+        with self.assertRaises(cs.CertSpoofError):
+            cs.inject_hook(smali, "deadbeef", _log())
+
+    def test_refuses_ambiguous_oncreate(self):
+        smali = self._mk("""
+            .class public Lcom/example/app/MainActivity;
+            .method protected onCreate(Landroid/os/Bundle;)V
+                .locals 1
+                return-void
+            .end method
+            .method public onCreate(Landroid/os/Bundle;)V
+                .locals 1
+                return-void
+            .end method
+        """)
+        with self.assertRaises(cs.CertSpoofError):
+            cs.inject_hook(smali, "deadbeef", _log())
+
+    def test_refuses_missing_oncreate(self):
+        smali = self._mk("""
+            .class public Lcom/example/app/MainActivity;
+            .method protected onStart()V
+                .locals 0
+                return-void
+            .end method
+        """)
+        with self.assertRaises(cs.CertSpoofError):
+            cs.inject_hook(smali, "deadbeef", _log())
+
+
+class FingerprintParsing(unittest.TestCase):
+    """Test the apksigner output parser directly without invoking the tool."""
+
+    def _parse(self, text: str):
+        # mirrors the regexes in extract_fingerprint / verify_fingerprint_matches
+        import re
+        m = re.search(r"SHA-256 digest:\s*([0-9a-fA-F:]+)", text)
+        if not m:
+            m = re.search(r"certificate SHA-256 digest:\s*([0-9a-fA-F:]+)", text)
+        return m.group(1).replace(":", "").lower() if m else None
+
+    def test_modern_apksigner_output(self):
+        out = "Signer #1 certificate SHA-256 digest: aa:bb:cc:dd:ee:ff\n"
+        self.assertEqual(self._parse(out), "aabbccddeeff")
+
+    def test_plain_digest_line(self):
+        out = "SHA-256 digest: AABBCCDDEEFF\n"
+        self.assertEqual(self._parse(out), "aabbccddeeff")
+
+    def test_missing_digest(self):
+        self.assertIsNone(self._parse("no certs here"))
+
+
+class CertSpoofClassWriter(unittest.TestCase):
+    def test_writes_helper_smali(self):
+        tmp = Path(tempfile.mkdtemp())
+        cs._write_cert_spoof_class(tmp, _log())
+        target = tmp / "smali" / "com" / "android" / "support" / "CertSpoof.smali"
+        self.assertTrue(target.is_file())
+        body = target.read_text()
+        self.assertIn("install(Ljava/lang/String;)V", body)
+        self.assertIn("get()Ljava/lang/String;", body)
+        self.assertIn("sFingerprint:Ljava/lang/String;", body)
+
+    def test_idempotent(self):
+        tmp = Path(tempfile.mkdtemp())
+        cs._write_cert_spoof_class(tmp, _log())
+        first = (tmp / "smali" / "com" / "android" / "support" / "CertSpoof.smali").read_text()
+        cs._write_cert_spoof_class(tmp, _log())
+        second = (tmp / "smali" / "com" / "android" / "support" / "CertSpoof.smali").read_text()
+        self.assertEqual(first, second)
+
+
+class VerifyFingerprint(unittest.TestCase):
+    """verify_fingerprint_matches must return True only when the digest matches."""
+
+    def test_mismatch_logs_warning_banner(self):
+        tmp = Path(tempfile.mkdtemp())
+        apk = tmp / "out.apk"
+        apk.write_bytes(b"apk")
+
+        captured = []
+
+        class FakeLog:
+            def log(self, lvl, msg): captured.append((lvl, msg))
+            def error(self, msg): captured.append(("ERROR", msg))
+            def info(self, msg): captured.append(("INFO", msg))
+            def warning(self, msg): captured.append(("WARN", msg))
+
+        # Patch find_tool + subprocess.run inside cert_spoof for this test only.
+        from unittest import mock
+        fake_proc = mock.Mock(returncode=0, stdout="Signer #1 certificate SHA-256 digest: ff:ff:ff:ff\n", stderr="")
+        with mock.patch.object(cs.am, "find_tool", return_value="/fake/apksigner"), \
+             mock.patch.object(cs.subprocess, "run", return_value=fake_proc):
+            ok = cs.verify_fingerprint_matches(apk, "aabbccdd", FakeLog())
+        self.assertFalse(ok)
+        self.assertTrue(any("FINGERPRINT MISMATCH" in m for _, m in captured))
+
+    def test_match_logs_success(self):
+        tmp = Path(tempfile.mkdtemp())
+        apk = tmp / "out.apk"
+        apk.write_bytes(b"apk")
+
+        captured = []
+
+        class FakeLog:
+            def log(self, lvl, msg): captured.append((lvl, msg))
+            def error(self, msg): captured.append(("ERROR", msg))
+            def info(self, msg): captured.append(("INFO", msg))
+            def warning(self, msg): captured.append(("WARN", msg))
+
+        from unittest import mock
+        fake_proc = mock.Mock(returncode=0, stdout="Signer #1 certificate SHA-256 digest: aa:bb:cc:dd\n", stderr="")
+        with mock.patch.object(cs.am, "find_tool", return_value="/fake/apksigner"), \
+             mock.patch.object(cs.subprocess, "run", return_value=fake_proc):
+            ok = cs.verify_fingerprint_matches(apk, "aabbccdd", FakeLog())
+        self.assertTrue(ok)
+        self.assertTrue(any("VERIFICATION SUCCESS" in m for _, m in captured))
+
+
+if __name__ == "__main__":
+    unittest.main()
